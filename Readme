@@ -1,0 +1,133 @@
+#	CSE 533 Network Programming
+#	Assignment #2, Due: Sunday, November 2nd
+#	Name: Yiqi Yu, ID: 109215949, Jing Yang, ID: 107950330
+#	Note: We submitted two copies of assignment, please check the other submittion in case this one cannot work as expected.
+#	File: Readme
+================================================================================
+1. Handle all interfaces on the server
+
+We bind a UDP socket for each interface available on the server, and store the interface information into a array structure as below:
+
+struct srv_ifi_info {
+  int sockfd;
+  char if_name[16];
+  struct sockaddr_in ip;
+  struct sockaddr_in netmask;
+  struct sockaddr_in subnet;
+
+  struct cli_info* header;
+};
+
+as required we only bind the unicast address (ifi_address) to each socket.
+
+2. Measurement for Timeout
+We modified Steven's code in 'unprtt.h' and 'rtt.c', in order to use integer arithmetic rather than floating point arithmetic, and the variable declarations are changed from float to int. 
+
+In rtt_timeout(), after doubling the RTO, we pass its value through rtt_minmax(). 
+int rtt_timeout(struct rtt_info_plus *ptr) {
+	ptr->rtt_rto *= 2;
+
+  ptr->rtt_rto = rtt_minmax(RTT_RTOCALC(ptr));
+
+  printf("rtt_nrexmt = %d\n", ptr->rtt_nrexmt);
+	if (++ptr->rtt_nrexmt > RTT_MAXNREXMT)
+    return(-1);
+
+	return(0);
+}
+
+In rtt_stop(), we modified the comparation and calculation using int:
+
+void rtt_stop(struct rtt_info_plus *ptr, uint32_t ms) {
+	int delta;
+    ptr->rtt_rtt = ms;
+	delta = ptr->rtt_rtt - ptr->rtt_srtt;
+	ptr->rtt_srtt += delta / 8;
+	if (delta < 0)
+		delta = -delta;
+	ptr->rtt_rttvar += (delta - ptr->rtt_rttvar) / 4;
+	ptr->rtt_rto = rtt_minmax(RTT_RTOCALC(ptr));
+}
+================================================================================
+ARQ Sliding-windows and Fast Retransmit
+
+3.1 sliding window
+Here we used circular array to act as send sliding window.
+When a data packet is send for first time,its content will be saved in this array in order in case there's retransmit.If retransmit happens data will be pulled from this array and send again.
+once ACK for this data packet is received, corresponding position in array will be cleaned for other data.
+
+3.2 fast retransmit
+
+Once we get >= 3 duplicate ACKs, we'll retransmit packet corresponding to this ACK,don't wait until timeout.
+
+4. Flow Control
+A circular array is also used in receiver side to function as receiver window and save packets received. Every time an ACK is sent back,receiver will update the available receiver window size so sender could decide how many packets to be sent.
+
+5. Congestion Control
+
+5.1 SlowStart
+At the beginning,cwnd is set to 1 and ssthresh is set to 127(65533 bytes).
+
+When cwnd is less than ssthresh,cwnd grows by 1 each time sender get a valid ACK.
+
+5.2 Congestion Avoidance  
+When cwnd >= ssthresh, it will grow by 1/cwnd each time sender get a valid ACK.
+
+when a congestion happens,here we only consider timeout condition:
+
+ssthresh is set to half of current window size(the minimum of cwnd and the receiver's advertised window) but at least 2.
+in addition cwnd is set to 1.
+
+
+5.3 Fast Recovery (without window-inflation)
+
+we set this according to the tcp protocol book,but no window inflation.
+
+If we get 3 duplicate ACKs,ssthresh is set to half of current window size(the minimum of cwnd and the receiver's advertised window) but at least 2. As there's no window inflation, we won't change cwnd.
+
+6. Probing
+If received client window size is 0, sender will send a probing packet with ACK#=-2,as a special label that client can recognize.Client will then advertise its current available window size. If there's available position in receiver's advertised window, sending window is opened. if there's no position, another probing packet will be transmitted after 3 seconds.
+
+7. clean closing
+Server start closing process after finish transferring file and get all ACKs.
+Server will first send a package with sequence# -8 as Ending Signal.
+Client will then send ACK # -9 to advertise it got the Ending Signal.
+Then server will then send a package with sequence# -9 as FIN,tell client to close.
+
+In above process,If client dropped packet/ACK it received/sent, server will retransmit packet after time out to ensure ending/FIN message is correctly received。
+
+Client may choose to drop the final ACK #-10 (ACK that tell server it's closing).
+In this condition it will try to keep send the final ACK until finally sent it successfully.The client and the reader thread will close.Main thread will sleep for 3 seconds before closing to ensure read thread print whole file.
+After get final ACK from client,server child thread will exit too.
+
+
+================================================================================
+Establishing Connections between client and server
+
+8. As mentioned before, we use the Get_ifi_info_plus() to acquire all interface information for the current host. To recoginze if the client and server are on the same host or not, we use bitwise & between client ip address and the network mask, as well as desired server address and the network mask, if those two value are same then the server and client are local to each other. Note there might be multiple interface satifies this condition, so we use longest prefix mathing method to pick up such interface address which has the longest netwokmask. If server and client share samp ip, then we use loopback address '127.0.0.1' for further communication. We also applied SO_DONTROUTE socket option for the local client and server pair.
+
+9. Since we have simulate the mechanism of datagram loss, correspoding behavior could also be tested. In case which the probablity is 1.0, all datagrams should be dropped and the client will give up after retransmissting 12 times; in case of the probablity is 0.0, all datagrams should be delivered to the server so should successfully establish connection between client and server.
+
+10. We use the struct below to store all clients connection information in the server, to avoid forking multiple child process to handle same client request, we use a linked list to record all client information, once a client is registered, it's ip address and port number will be recorded, after a client process is handled, the corresponding entry will be removed by catching SIGCHLD:
+
+struct srv_ifi_info {
+  int sockfd;
+  char if_name[16];
+  struct sockaddr_in ip;
+  struct sockaddr_in netmask;
+  struct sockaddr_in subnet;
+
+  struct cli_info* header;
+};
+
+struct cli_info {
+  int fd_pipe;
+  pid_t pid_child;
+  struct sockaddr_in cliaddr;
+
+  struct cli_info* next;
+};
+
+between the server and client we use a pipe for communication. 
+
+11. After a child is forked by the server process, it will keep a listening sock inherited from server as well as a connecting socket for new connection. If the packet which contains server child's new port number is dropped, the client will request again, and the server child will receive parent's message from the pipe, then write two copies of it's new port number to the listening socket and connection socket, since it does not if child established connection to it's new port number. After the connection is established, the child process will close the listening socket.
